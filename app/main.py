@@ -22,11 +22,14 @@ from .models import (
     DataAccessResponse,
     DecisionResponse,
     GrantConsentRequest,
+    NarrowConsentRequest,
     Patient,
     PatientCreate,
     Recipient,
     RecipientCreate,
+    ResumeConsentRequest,
     RevokeConsentRequest,
+    SuspendConsentRequest,
 )
 from .storage import Store
 
@@ -72,6 +75,18 @@ def create_app(seed: bool = True) -> FastAPI:
     @app.post("/consents/revoke", response_model=Consent)
     def revoke_consent(payload: RevokeConsentRequest) -> Consent:
         return ConsentService(store, audit).revoke(payload)
+
+    @app.post("/consents/narrow", response_model=Consent)
+    def narrow_consent(payload: NarrowConsentRequest) -> Consent:
+        return ConsentService(store, audit).narrow(payload)
+
+    @app.post("/consents/suspend", response_model=Consent)
+    def suspend_consent(payload: SuspendConsentRequest) -> Consent:
+        return ConsentService(store, audit).suspend(payload)
+
+    @app.post("/consents/resume", response_model=Consent)
+    def resume_consent(payload: ResumeConsentRequest) -> Consent:
+        return ConsentService(store, audit).resume(payload)
 
     @app.post("/access/decision", response_model=DecisionResponse)
     def access_decision(payload: AccessRequest) -> DecisionResponse:
