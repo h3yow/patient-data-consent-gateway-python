@@ -41,6 +41,7 @@ class DenialReason(str, Enum):
 
     CONSENT_NOT_FOUND = "consent_not_found"
     CONSENT_REVOKED = "consent_revoked"
+    CONSENT_SUSPENDED = "consent_suspended"
     CONSENT_EXPIRED = "consent_expired"
     PURPOSE_MISMATCH = "purpose_mismatch"
     RECIPIENT_MISMATCH = "recipient_mismatch"
@@ -53,6 +54,9 @@ class AuditEventType(str, Enum):
 
     CONSENT_GRANTED = "consent_granted"
     CONSENT_REVOKED = "consent_revoked"
+    CONSENT_SCOPE_NARROWED = "consent_scope_narrowed"
+    CONSENT_SUSPENDED = "consent_suspended"
+    CONSENT_RESUMED = "consent_resumed"
     ACCESS_GRANTED = "access_granted"
     ACCESS_DENIED = "access_denied"
 
@@ -72,6 +76,10 @@ class Consent(BaseModel):
     expires_at: datetime | None = None
     revoked_at: datetime | None = None
     active: bool = True
+    # 暂停状态：active 仍为 True（暂停不是撤销），suspended=True 时访问一律拒绝
+    suspended: bool = False
+    suspended_at: datetime | None = None
+    resumed_at: datetime | None = None
 
 
 class Patient(BaseModel):
@@ -107,6 +115,7 @@ class AuditEvent(BaseModel):
     consent_id: str | None = None
     requested_fields: list[FieldCategory] | None = None
     allowed_fields: list[FieldCategory] | None = None
+    previous_fields: list[FieldCategory] | None = None
     returned_fields: list[str] | None = None
     masked_fields: list[str] | None = None
     denial_reason: DenialReason | None = None
@@ -126,6 +135,24 @@ class GrantConsentRequest(BaseModel):
 
 
 class RevokeConsentRequest(BaseModel):
+    consent_id: str
+    now: datetime | None = None
+
+
+class NarrowConsentRequest(BaseModel):
+    """收窄同意范围：仅允许把字段类别改成当前范围的真子集。"""
+
+    consent_id: str
+    allowed_fields: list[FieldCategory]
+    now: datetime | None = None
+
+
+class SuspendConsentRequest(BaseModel):
+    consent_id: str
+    now: datetime | None = None
+
+
+class ResumeConsentRequest(BaseModel):
     consent_id: str
     now: datetime | None = None
 

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from .access import AccessService
 from .audit import AuditLogger
 from .consent import ConsentService
-from .errors import GatewayError
+from .errors import ConsentStateError, GatewayError
 from .models import (
     AccessRequest,
     AuditEvent,
@@ -22,11 +22,14 @@ from .models import (
     DataAccessResponse,
     DecisionResponse,
     GrantConsentRequest,
+    NarrowConsentRequest,
     Patient,
     PatientCreate,
     Recipient,
     RecipientCreate,
+    ResumeConsentRequest,
     RevokeConsentRequest,
+    SuspendConsentRequest,
 )
 from .storage import Store
 
@@ -53,6 +56,14 @@ def create_app(seed: bool = True) -> FastAPI:
             content={"allowed": False, "denial_reason": exc.reason.value, "message": exc.message},
         )
 
+    @app.exception_handler(ConsentStateError)
+    async def consent_state_error_handler(_: Request, exc: ConsentStateError) -> JSONResponse:
+        logger.warning("consent_state_error code=%s", exc.code)
+        return JSONResponse(
+            status_code=400,
+            content={"error": exc.code, "message": exc.message},
+        )
+
     @app.post("/admin/patients", response_model=Patient, status_code=201)
     def create_patient(payload: PatientCreate) -> Patient:
         patient = Patient(**payload.model_dump())
@@ -73,16 +84,31 @@ def create_app(seed: bool = True) -> FastAPI:
     def revoke_consent(payload: RevokeConsentRequest) -> Consent:
         return ConsentService(store, audit).revoke(payload)
 
+    @app.post("/consents/narrow", response_model=Consent)
+    def narrow_consent(payload: NarrowConsentRequest) -> Consent:
+        return ConsentService(store, audit).narrow(payload)
+
+    @app.post("/consents/suspend", response_model=Consent)
+    def suspend_consent(payload: SuspendConsentRequest) -> Consent:
+        return ConsentService(store, audit).suspend(payload)
+
+    @app.post("/consents/resume", response_model=Consent)
+    def resume_consent(payload: ResumeConsentRequest) -> Consent:
+        return ConsentService(store, audit).resume(payload)
+
     @app.post("/access/decision", response_model=DecisionResponse)
     def access_decision(payload: AccessRequest) -> DecisionResponse:
-        # 纯决策端点：不落数据、不脱敏，仅返回授权结论与范围
-        return ConsentService(store, audit).evaluate(
-            patient_id=payload.patient_id,
-            recipient_id=payload.recipient_id,
-            purpose=payload.purpose,
-            requested_fields=list(payload.requested_fields),
-            now=payload.now,
-        )
+        # 纯决策端点：不落数据、不脱敏，仅返回授权结论与范围。
+        # 在存储锁内评估，与收窄/暂停等状态变更互斥，结论自洽。
+        service = ConsentService(store, audit)
+        with store.lock:
+            return service.evaluate(
+                patient_id=payload.patient_id,
+                recipient_id=payload.recipient_id,
+                purpose=payload.purpose,
+                requested_fields=list(payload.requested_fields),
+                now=payload.now,
+            )
 
     @app.post("/access/data", response_model=DataAccessResponse)
     def access_data(payload: AccessRequest) -> DataAccessResponse:

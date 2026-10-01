@@ -14,7 +14,6 @@ import logging
 from .audit import AuditLogger
 from .consent import ConsentService, _as_aware
 from .deidentify import project_patient
-from .errors import GatewayError
 from .models import (
     AccessRequest,
     AuditEventType,
@@ -35,54 +34,58 @@ class AccessService:
     def access_data(self, req: AccessRequest) -> DataAccessResponse:
         now = _as_aware(req.now)
 
-        patient = self.store.get_patient(req.patient_id)
-        if patient is None:
-            # 患者不存在按“未授权”处理，且不泄露任何数据
-            decision = self._deny_with_audit(
-                req, now, DenialReason.CONSENT_NOT_FOUND
-            )
-            return DataAccessResponse(
-                allowed=False, denial_reason=decision
-            )
+        # 整条访问路径（决策 -> 审计 -> 投影）在同一把存储锁内完成，
+        # 与授予/撤销/收窄/暂停/恢复互斥：每个访问看到的要么全是变更前状态、
+        # 要么全是变更后状态，绝不会返回已被移掉或已暂停的字段。
+        with self.store.lock:
+            patient = self.store.get_patient(req.patient_id)
+            if patient is None:
+                # 患者不存在按“未授权”处理，且不泄露任何数据
+                self._record_denied(req, now, DenialReason.CONSENT_NOT_FOUND, None)
+                return DataAccessResponse(
+                    allowed=False, denial_reason=DenialReason.CONSENT_NOT_FOUND
+                )
 
-        decision = self.consents.evaluate(
-            patient_id=req.patient_id,
-            recipient_id=req.recipient_id,
-            purpose=req.purpose,
-            requested_fields=list(req.requested_fields),
-            now=now,
-        )
-
-        if not decision.allowed:
-            # 审计先落盘；若审计本身失败，这里抛出 AUDIT_WRITE_FAILED（失败关闭）
-            self._record_denied(req, now, decision.denial_reason, decision.consent_id)
-            logger.info(
-                "access_denied patient=%s recipient=%s purpose=%s requested=%s reason=%s",
-                req.patient_id,
-                req.recipient_id,
-                req.purpose.value,
-                [f.value for f in req.requested_fields],
-                decision.denial_reason.value if decision.denial_reason else "unknown",
-            )
-            return DataAccessResponse(
-                allowed=False,
-                consent_id=decision.consent_id,
-                denial_reason=decision.denial_reason,
+            decision = self.consents.evaluate(
+                patient_id=req.patient_id,
+                recipient_id=req.recipient_id,
+                purpose=req.purpose,
+                requested_fields=list(req.requested_fields),
+                now=now,
             )
 
-        # 授权通过：按请求范围投影（敏感字段在 project_patient 内脱敏）
-        data, returned_fields, masked_fields = project_patient(
-            patient, decision.allowed_fields
-        )
+            if not decision.allowed:
+                # 审计先落盘；若审计本身失败，这里抛出 AUDIT_WRITE_FAILED（失败关闭）
+                self._record_denied(
+                    req, now, decision.denial_reason, decision.consent_id
+                )
+                logger.info(
+                    "access_denied patient=%s recipient=%s purpose=%s requested=%s reason=%s",
+                    req.patient_id,
+                    req.recipient_id,
+                    req.purpose.value,
+                    [f.value for f in req.requested_fields],
+                    decision.denial_reason.value if decision.denial_reason else "unknown",
+                )
+                return DataAccessResponse(
+                    allowed=False,
+                    consent_id=decision.consent_id,
+                    denial_reason=decision.denial_reason,
+                )
 
-        # 成功访问也必须先审计（含去标识化结果：仅字段名/类别，无原值）
-        self._record_granted(
-            req,
-            now,
-            decision.consent_id,
-            returned_fields,
-            masked_fields,
-        )
+            # 授权通过：按请求范围投影（敏感字段在 project_patient 内脱敏）
+            data, returned_fields, masked_fields = project_patient(
+                patient, decision.allowed_fields
+            )
+
+            # 成功访问也必须先审计（含去标识化结果：仅字段名/类别，无原值）
+            self._record_granted(
+                req,
+                now,
+                decision.consent_id,
+                returned_fields,
+                masked_fields,
+            )
 
         logger.info(
             "access_granted patient=%s recipient=%s purpose=%s returned=%s masked=%s",
@@ -143,9 +146,3 @@ class AccessService:
             detail="access granted; sensitive fields masked before return",
         )
         self.audit.record(event)
-
-    def _deny_with_audit(
-        self, req: AccessRequest, now, reason: DenialReason
-    ) -> DenialReason:
-        self._record_denied(req, now, reason, None)
-        return reason
