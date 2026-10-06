@@ -197,6 +197,67 @@ def test_suspend_and_resume_are_recorded_in_audit(client):
     assert stamps == sorted(stamps)
 
 
+def test_suspended_and_expired_denies_as_suspended_not_expired(client):
+    """暂停与过期叠加：暂停期间一律以 consent_suspended 拒绝，不与已过期混淆；
+    恢复之后仍按过期处理。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    client.post(
+        "/consents/suspend",
+        json={"consent_id": consent["consent_id"], "now": "2026-02-01T00:00:00Z"},
+    )
+
+    # 暂停期间且已过有效期：原因是可区分的“暂停中”，不是“已过期”
+    for moment in ("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z"):
+        body = _access(client, now=moment).json()
+        assert body["allowed"] is False
+        assert body["denial_reason"] == "consent_suspended"
+        assert body["data"] is None
+        # 纯决策端点与数据端点结论一致
+        decision = client.post("/access/decision", json={
+            "patient_id": "P-001",
+            "recipient_id": "R-HOSPITAL",
+            "purpose": "treatment",
+            "requested_fields": ["medical"],
+            "now": moment,
+        }).json()
+        assert decision["denial_reason"] == "consent_suspended"
+
+    # 恢复之后：暂停标记解除，仍按过期拒绝
+    client.post(
+        "/consents/resume",
+        json={"consent_id": consent["consent_id"], "now": "2026-07-02T00:00:00Z"},
+    )
+    body = _access(client, now="2026-07-02T00:00:01Z").json()
+    assert body["allowed"] is False
+    assert body["denial_reason"] == "consent_expired"
+    assert body["data"] is None
+
+
+def test_suspended_not_yet_expired_still_reports_suspended(client):
+    """暂停中但未过期：拒绝原因同样是 consent_suspended（与过期无关）。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    client.post(
+        "/consents/suspend",
+        json={"consent_id": consent["consent_id"], "now": "2026-02-01T00:00:00Z"},
+    )
+    body = _access(client, now="2026-03-01T00:00:00Z").json()
+    assert body["denial_reason"] == "consent_suspended"
+    # 恢复后（仍在有效期内）按原范围放行
+    client.post(
+        "/consents/resume",
+        json={"consent_id": consent["consent_id"], "now": "2026-03-02T00:00:00Z"},
+    )
+    assert _access(client, now="2026-03-03T00:00:00Z").json()["allowed"] is True
+
+
 def test_narrow_still_applies_while_suspended(client):
     """暂停期间可以收窄；恢复后按收窄后的范围生效。"""
     consent = _grant(client, allowed_fields=["identity", "medical"])

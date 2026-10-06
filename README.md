@@ -38,6 +38,8 @@
 
 - 暂停期间该接收方对该用途的访问一律拒绝，原因码为独立的
   `consent_suspended`，与未授权/已撤销/已过期/用途不符/接收方不符/超范围都可区分；
+- **暂停与过期叠加时以暂停为准**：暂停期间即使有效期已过，访问也一律以
+  `consent_suspended` 拒绝，不与 `consent_expired` 混淆；恢复之后再按过期判定；
 - 恢复后**同一条同意**按原来的有效期与范围继续生效；
 - **暂停不改变有效期**：暂停期间时间照常流逝，暂停中过期的同意即使恢复
   也仍按 `consent_expired` 拒绝；
@@ -67,12 +69,16 @@
 | --- | --- | --- |
 | 1 | `consent_not_found` | 该患者从未授予过任何同意（或患者不存在） |
 | 2 | `consent_revoked` | 命中的同意 `active=false`，撤销对后续访问立即生效 |
-| 3 | `consent_expired` | `expires_at <= now` |
-| 4 | `consent_suspended` | 同意处于暂停状态（恢复前一律拒绝） |
+| 3 | `consent_suspended` | 同意处于暂停状态（恢复前一律拒绝；**暂停与过期叠加时优先报暂停**） |
+| 4 | `consent_expired` | `expires_at <= now`（仅在未暂停时判定；恢复后仍按过期处理） |
 | 5 | `purpose_mismatch` | 存在同意但用途不匹配 |
 | 6 | `recipient_mismatch` | 存在同意但接收方不匹配 |
 | 7 | `scope_exceeded` | 请求的任一字段类别不在 `allowed_fields` 内（整体拒绝） |
 | 8 | `audit_write_failed` | 审计无法写入，**失败关闭**（见第 4 节） |
+
+原因划分规则：撤销是终态，优先于一切；暂停是暂态，暂停期间无论是否
+过期都报 `consent_suspended`；只有未暂停时才落到过期判定，因此恢复一条
+暂停中已过期的同意，访问结论从 `consent_suspended` 变为 `consent_expired`。
 
 写操作特有的可区分错误（同样返回 HTTP 403）：
 
@@ -111,10 +117,15 @@
 3. **失败关闭覆盖所有改变同意状态的写操作**（授予、撤销、收窄、暂停、恢复）
    以及数据访问：审计写不进去时，操作以 `audit_write_failed`（HTTP 403）
    整体失败，且**不留半生效状态**——实现上审计先落盘、状态后提交，
-   失败前后同一个访问请求拿到的结论一模一样。
-4. 状态变更采用写时复制并在存储锁内提交：收窄/暂停/恢复/撤销与访问并发时，
-   每个访问要么看到变更前的快照、要么看到变更后的快照，
-   绝不会返回已被移掉或已暂停的字段。
+   且两步在同一临界区内完成：失败的写既不改变同意状态，也不在审计流中
+   留下痕迹；失败前后同一个访问请求拿到的结论一模一样，不存在
+   “报错但其实已生效”或“报错但其实没改”的半生效情况。
+4. **并发变更的自洽语义（可线性化）**：同意状态变更采用写时复制，并在
+   存储锁内与审计落盘一起提交；访问的「读快照 -> 决策 -> 写审计」同样在
+   同一临界区内原子完成。因此收窄/暂停/恢复/撤销与访问并发时，每个访问
+   要么看到完整的变更前快照、要么看到完整的变更后快照——变更生效之后
+   不会再返回已被移掉的字段，也不会再返回已暂停同意的数据；审计流中
+   访问事件的顺序即这些访问的线性化顺序，可用于稳定重放验证。
 5. 可通过 `POST /test/audit-failure?enabled=true|false` 注入 / 解除审计落盘故障，
    专门用于验证失败关闭行为。
 
@@ -138,7 +149,8 @@
 
 - 收窄只能缩小范围；**扩权必须重新授予**一条新同意（决策取三元组下最近授予的一条）。
 - 撤销是终态：已撤销的同意不能收窄、暂停或恢复，也不会因新授予而“复活”。
-- 暂停是暂态：不改变有效期、不改变范围、不等于撤销；过期判定不受暂停影响。
+- 暂停是暂态：不改变有效期、不改变范围、不等于撤销；暂停期间一律以
+  `consent_suspended` 拒绝（即使有效期已过），恢复之后仍按过期判定。
 - 同一 `(patient, recipient, purpose)` 下多条历史同意的决策规则不变：
   最近授予的一条生效，其自身的撤销/过期/暂停状态依次判定。
 
@@ -153,7 +165,8 @@
 # 启动服务
 uv run uvicorn main:app --reload
 
-# 运行全部测试（55 个用例；-s 打开日志，打印输入与授权判定依据）
+# 运行全部测试（58 个用例；-s 打开日志，打印输入与授权判定依据，
+# 并按“业务=... 用例=... 结果=...”逐条列出各业务域的用例结果）
 uv run pytest
 
 # 仅跑某一类场景
@@ -162,10 +175,16 @@ uv run pytest tests/test_deidentification.py     # 最小必要/脱敏边界
 uv run pytest tests/test_audit.py                # 审计/失败关闭
 uv run pytest tests/test_concurrency.py          # 并发撤销与访问
 uv run pytest tests/test_narrow.py               # 范围收窄：生效/只减不增/可追溯
-uv run pytest tests/test_suspend_resume.py       # 暂停/恢复状态流转
-uv run pytest tests/test_fail_closed.py          # 写操作失败关闭一致性
+uv run pytest tests/test_suspend_resume.py       # 暂停/恢复状态流转、暂停与过期叠加
+uv run pytest tests/test_fail_closed.py          # 写操作失败关闭一致性（含并发）
 uv run pytest tests/test_change_concurrency.py   # 变更与访问并发自洽性
 uv run pytest tests/test_edge_cases.py           # 边界与用例隔离
+
+# 并发用例需多轮重复验证（单调性基于审计流的线性化顺序断言，应稳定通过）
+for i in $(seq 1 20); do
+  uv run pytest -q tests/test_concurrency.py tests/test_change_concurrency.py \
+    tests/test_fail_closed.py || break
+done
 ```
 
 测试全部通过服务的 HTTP 对外接口验证；`tests/conftest.py` 为每个用例构造

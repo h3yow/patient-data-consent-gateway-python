@@ -4,7 +4,10 @@
 - 被拒绝时 data 为 None，绝不返回任何受保护数据；
 - 每次访问（无论成败）都先写审计，审计写不进去则失败关闭，
   返回 AUDIT_WRITE_FAILED 且不返回数据；
-- 审计事件只含字段名/类别与脱敏标记，不含原始敏感值。
+- 审计事件只含字段名/类别与脱敏标记，不含原始敏感值；
+- 整个「读快照 -> 决策 -> 写审计」在存储锁内原子完成：与收窄/暂停/
+  恢复/撤销等变更互斥，每个访问只能看到完整的变更前或变更后状态，
+  审计流顺序即访问的线性化顺序。
 """
 
 from __future__ import annotations
@@ -34,7 +37,12 @@ class AccessService:
 
     def access_data(self, req: AccessRequest) -> DataAccessResponse:
         now = _as_aware(req.now)
+        # 原子临界区：决策、投影与审计写入作为一个整体与同意变更互斥，
+        # 保证并发下每个访问只观察到自洽快照，且审计顺序即线性化顺序。
+        with self.store.lock:
+            return self._access_data_locked(req, now)
 
+    def _access_data_locked(self, req: AccessRequest, now) -> DataAccessResponse:
         patient = self.store.get_patient(req.patient_id)
         if patient is None:
             # 患者不存在按“未授权”处理，且不泄露任何数据

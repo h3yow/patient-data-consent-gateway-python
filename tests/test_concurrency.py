@@ -57,18 +57,23 @@ def test_concurrent_revoke_and_accesses_never_observe_inconsistent_state(client)
     assert all(r["data"] is not None for r in allowed)
     assert all(r["data"] is None for r in denied)
 
-    # 一旦出现拒绝，其后的所有访问都必须拒绝（撤销立即生效，不可反复）
-    outcomes = [r["allowed"] for r in results]
-    first_deny = next((i for i, ok in enumerate(outcomes) if not ok), None)
-    if first_deny is not None:
-        assert all(ok is False for ok in outcomes[first_deny:])
-
     # 审计中每个成功访问都有 access_granted，每个拒绝都有 access_denied
     events = client.get("/audit").json()
     granted = [e for e in events if e["event_type"] == "access_granted"]
     denied_events = [e for e in events if e["event_type"] == "access_denied"]
     assert len(granted) == len(allowed)
     assert len(denied_events) == len(denied)
+
+    # 单调性按审计流（线性化顺序）验证：撤销生效后不得再放行。
+    # 访问的决策与审计写入在同一临界区完成，审计顺序即线性化顺序，
+    # 因此该断言多轮运行稳定（客户端收集顺序不参与顺序断言）。
+    seen_denied = False
+    for e in [e for e in events if e["event_type"] in ("access_granted", "access_denied")]:
+        if e["event_type"] == "access_denied":
+            assert e["denial_reason"] == "consent_revoked"
+            seen_denied = True
+        else:
+            assert not seen_denied, "撤销生效后仍放行了访问"
 
 
 def test_strictly_sequential_revoke_then_access(client):

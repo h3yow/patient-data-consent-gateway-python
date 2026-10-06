@@ -1,7 +1,10 @@
 """同意授权服务：授予、撤销、收窄、暂停、恢复与访问决策。
 
 评估固定顺序（决定拒绝原因的优先级，保证结论可解释）：
-未授权 -> 已撤销 -> 已过期 -> 已暂停 -> 用途不匹配 -> 接收方不匹配 -> 超出范围。
+未授权 -> 已撤销 -> 已暂停 -> 已过期 -> 用途不匹配 -> 接收方不匹配 -> 超出范围。
+
+暂停优先于过期：暂停期间一律以可区分的 consent_suspended 拒绝，
+不与已过期混淆；恢复之后仍按过期判定（暂停不延长有效期）。
 
 所有改变同意状态的写操作（授予/撤销/收窄/暂停/恢复）都遵循失败关闭：
 审计先落盘，落不进去则状态不变；状态变更采用写时复制并在存储锁内完成，
@@ -253,7 +256,24 @@ class ConsentService:
         requested_fields: list[FieldCategory],
         now: datetime | None = None,
     ) -> DecisionResponse:
-        """按固定顺序评估访问请求，返回纯决策结果（不写审计）。"""
+        """按固定顺序评估访问请求，返回纯决策结果（不写审计）。
+
+        整个评估在存储锁内完成：读取的是同一时刻的自洽快照，
+        不会在评估中途看到变更的一半（存储锁可重入，写操作/访问可嵌套调用）。
+        """
+        with self.store.lock:
+            return self._evaluate_locked(
+                patient_id, recipient_id, purpose, requested_fields, now
+            )
+
+    def _evaluate_locked(
+        self,
+        patient_id: str,
+        recipient_id: str,
+        purpose: object,
+        requested_fields: list[FieldCategory],
+        now: datetime | None = None,
+    ) -> DecisionResponse:
         moment = _as_aware(now)
         from .models import Purpose
 
@@ -305,7 +325,21 @@ class ConsentService:
                 denial_reason=DenialReason.CONSENT_REVOKED,
             )
 
-        # 3) 已过期
+        # 3) 已暂停（临时冻结，恢复前一律拒绝；与撤销/过期可区分。
+        #    暂停优先于过期：暂停中且已过期的同意仍以 consent_suspended 拒绝）
+        if consent.suspended_at is not None:
+            logger.info(
+                "access_denied consent_id=%s reason=%s",
+                consent.consent_id,
+                DenialReason.CONSENT_SUSPENDED.value,
+            )
+            return DecisionResponse(
+                allowed=False,
+                consent_id=consent.consent_id,
+                denial_reason=DenialReason.CONSENT_SUSPENDED,
+            )
+
+        # 4) 已过期（恢复之后仍按过期处理：暂停不延长有效期）
         if consent.expires_at is not None and consent.expires_at <= moment:
             logger.info(
                 "access_denied consent_id=%s reason=%s expires_at=%s now=%s",
@@ -318,19 +352,6 @@ class ConsentService:
                 allowed=False,
                 consent_id=consent.consent_id,
                 denial_reason=DenialReason.CONSENT_EXPIRED,
-            )
-
-        # 4) 已暂停（临时冻结，恢复前一律拒绝；与撤销/过期可区分）
-        if consent.suspended_at is not None:
-            logger.info(
-                "access_denied consent_id=%s reason=%s",
-                consent.consent_id,
-                DenialReason.CONSENT_SUSPENDED.value,
-            )
-            return DecisionResponse(
-                allowed=False,
-                consent_id=consent.consent_id,
-                denial_reason=DenialReason.CONSENT_SUSPENDED,
             )
 
         # 5/6) 用途、接收方匹配（find_consents 已保证；保留防御性校验）
