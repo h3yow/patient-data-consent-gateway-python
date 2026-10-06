@@ -38,10 +38,16 @@
 
 - 暂停期间该接收方对该用途的访问一律拒绝，原因码为独立的
   `consent_suspended`，与未授权/已撤销/已过期/用途不符/接收方不符/超范围都可区分；
+- **暂停原因优先于过期**：暂停期间即使 `expires_at` 已经过了，访问也一律以
+  `consent_suspended` 拒绝，绝不与 `consent_expired` 混淆；恢复之后同一条同意
+  才重新按有效期判定（已过期仍按 `consent_expired` 拒绝）；
 - 恢复后**同一条同意**按原来的有效期与范围继续生效；
 - **暂停不改变有效期**：暂停期间时间照常流逝，暂停中过期的同意即使恢复
   也仍按 `consent_expired` 拒绝；
+- 暂停是管理操作：对尚未撤销的同意，无论其是否已过期都可以暂停/恢复，
+  暂停操作本身不做有效期校验；
 - 暂停不等于撤销：已撤销的同意不能被暂停，也不能被恢复（`consent_revoked`）；
+  撤销的判定优先级最高，已暂停且已过期的同意被撤销后一律报 `consent_revoked`；
 - 重复暂停返回 `consent_suspended`，对未暂停的同意执行恢复返回
   `consent_not_suspended`；
 - 暂停与恢复分别写入 `consent_suspended` / `consent_resumed` 审计事件。
@@ -67,8 +73,8 @@
 | --- | --- | --- |
 | 1 | `consent_not_found` | 该患者从未授予过任何同意（或患者不存在） |
 | 2 | `consent_revoked` | 命中的同意 `active=false`，撤销对后续访问立即生效 |
-| 3 | `consent_expired` | `expires_at <= now` |
-| 4 | `consent_suspended` | 同意处于暂停状态（恢复前一律拒绝） |
+| 3 | `consent_suspended` | 同意处于暂停状态（恢复前一律拒绝；**即使已过期也先报暂停**） |
+| 4 | `consent_expired` | `expires_at <= now`（暂停解除后才会走到此判定） |
 | 5 | `purpose_mismatch` | 存在同意但用途不匹配 |
 | 6 | `recipient_mismatch` | 存在同意但接收方不匹配 |
 | 7 | `scope_exceeded` | 请求的任一字段类别不在 `allowed_fields` 内（整体拒绝） |
@@ -111,12 +117,25 @@
 3. **失败关闭覆盖所有改变同意状态的写操作**（授予、撤销、收窄、暂停、恢复）
    以及数据访问：审计写不进去时，操作以 `audit_write_failed`（HTTP 403）
    整体失败，且**不留半生效状态**——实现上审计先落盘、状态后提交，
-   失败前后同一个访问请求拿到的结论一模一样。
-4. 状态变更采用写时复制并在存储锁内提交：收窄/暂停/恢复/撤销与访问并发时，
-   每个访问要么看到变更前的快照、要么看到变更后的快照，
-   绝不会返回已被移掉或已暂停的字段。
+   失败前后同一个访问请求拿到的结论一模一样。业务规则校验（如收窄只减不增、
+   重复暂停等）先于审计写入触发，因此对“本就不合法”的请求仍返回对应业务
+   原因码；只有业务上可以成立、但审计落盘失败的写操作才以
+   `audit_write_failed` 失败关闭。
+4. **并发自洽（线性化快照语义）**：全部状态变更（收窄/暂停/恢复/撤销/授予）
+   与每次数据访问都串行化在存储的同一把锁内。状态变更采用写时复制并在锁内
+   提交（审计先落盘、状态后提交），访问的「读取患者 → 决策 → 审计落盘 →
+   投影脱敏」也在同一临界区完成。因此：
+   - 每个访问要么完整看到变更前快照、要么完整看到变更后快照，绝不会
+     返回已经被移掉的字段、也绝不会在暂停生效后返回暂停同意的数据；
+   - 对同一工作线程顺序发出的请求，结论与状态提交顺序一致（撤销/收窄/暂停
+     一旦生效，该线程之后只能看到变更后状态）；
+   - 审计事件的落盘顺序与各请求决策所依据的快照顺序严格一致；
+   - 写操作在并发下仍保持原子：要么审计与状态都完成，要么都不发生，
+     不允许“接口报错但同意其实已经改了/其实没改”。注意跨线程按客户端
+     完成时刻聚合的顺序可能交错（先决策的请求响应被调度延后），这正是
+     快照语义，不属于不一致；用例只在单线程序列上断言单调性。
 5. 可通过 `POST /test/audit-failure?enabled=true|false` 注入 / 解除审计落盘故障，
-   专门用于验证失败关闭行为。
+   专门用于验证失败关闭行为（含并发注入/解除的场景）。
 
 ## 5. API 一览
 
@@ -138,7 +157,9 @@
 
 - 收窄只能缩小范围；**扩权必须重新授予**一条新同意（决策取三元组下最近授予的一条）。
 - 撤销是终态：已撤销的同意不能收窄、暂停或恢复，也不会因新授予而“复活”。
-- 暂停是暂态：不改变有效期、不改变范围、不等于撤销；过期判定不受暂停影响。
+- 暂停是暂态：不改变有效期、不改变范围、不等于撤销；**暂停期间访问一律以
+  `consent_suspended` 拒绝（即使同时已过期），恢复后已过期的仍按过期处理**；
+  过期判定在暂停解除之后重新生效。
 - 同一 `(patient, recipient, purpose)` 下多条历史同意的决策规则不变：
   最近授予的一条生效，其自身的撤销/过期/暂停状态依次判定。
 
@@ -153,8 +174,19 @@
 # 启动服务
 uv run uvicorn main:app --reload
 
-# 运行全部测试（55 个用例；-s 打开日志，打印输入与授权判定依据）
+# 运行全部测试（63 个用例；-s 打开日志，打印输入与授权判定依据，
+# 并在开始/结尾打印覆盖了哪些业务、各业务用例与结果的汇总）
 uv run pytest
+
+# 并发用例要多跑几轮，确认不依赖调度时序、结果可重复
+for i in $(seq 1 20); do
+  uv run pytest -q tests/test_concurrency.py tests/test_change_concurrency.py \
+    tests/test_fail_closed_concurrency.py | tail -1
+done
+
+# 想压得更狠可以提高并发用例内的迭代次数：
+ITERATIONS=200 WORKERS=4 \
+  uv run pytest tests/test_change_concurrency.py
 
 # 仅跑某一类场景
 uv run pytest tests/test_consent_decisions.py    # 同意状态/拒绝原因
@@ -162,11 +194,27 @@ uv run pytest tests/test_deidentification.py     # 最小必要/脱敏边界
 uv run pytest tests/test_audit.py                # 审计/失败关闭
 uv run pytest tests/test_concurrency.py          # 并发撤销与访问
 uv run pytest tests/test_narrow.py               # 范围收窄：生效/只减不增/可追溯
-uv run pytest tests/test_suspend_resume.py       # 暂停/恢复状态流转
-uv run pytest tests/test_fail_closed.py          # 写操作失败关闭一致性
+uv run pytest tests/test_suspend_resume.py       # 暂停/恢复流转 + 暂停与过期原因划分
+uv run pytest tests/test_fail_closed.py          # 写操作失败关闭一致性（顺序场景）
 uv run pytest tests/test_change_concurrency.py   # 变更与访问并发自洽性
+uv run pytest tests/test_fail_closed_concurrency.py # 并发下失败关闭一致性
 uv run pytest tests/test_edge_cases.py           # 边界与用例隔离
 ```
+
+并发用例的设计口径（保证多轮稳定、不偶发失败）：
+
+- 每个响应只断言**自身自洽**：放行必带完整数据且无拒绝原因；被拒必带
+  可区分原因且 `data=null`（收窄后只可能 `scope_exceeded`，暂停后只可能
+  `consent_suspended`，失败关闭只可能 `audit_write_failed`）；
+- 单调性只在**单个工作线程的请求序列**上断言——状态变更单调且服务端把
+  请求串行化，该线程一旦看到变更后状态就不可能再看到变更前；
+- 不对“跨线程按客户端完成时刻聚合”的顺序做假设（那是合法的快照交错）；
+- 每个用例内运行数百次并发访问（`ITERATIONS`/`WORKERS` 可调），并核对
+  审计事件数量、类型与每个响应一一对应。
+
+测试日志读法：每个测试文件开始前会打印“业务横幅”（该文件覆盖的业务），
+每个用例结束打印 `[PASS]/[FAIL] 用例名 (耗时)`，会话结尾的
+「按业务汇总」表逐文件给出通过/失败计数。
 
 测试全部通过服务的 HTTP 对外接口验证；`tests/conftest.py` 为每个用例构造
 **全新的应用与内存存储**，用例之间相互隔离、可重复执行。
@@ -205,5 +253,6 @@ app/
   deidentify.py   字段类别映射与脱敏、最小必要投影
   access.py       决策->审计->投影/脱敏 的访问编排（失败关闭）
   main.py         FastAPI 路由、错误响应、种子数据
-tests/            通过 HTTP 接口的隔离测试
+tests/            通过 HTTP 接口的隔离测试（含并发自洽与并发失败关闭）
+  conftest.py                       独立应用/存储夹具 + 业务横幅与按业务结果汇总
 ```

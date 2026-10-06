@@ -1,7 +1,8 @@
 """同意授权服务：授予、撤销、收窄、暂停、恢复与访问决策。
 
 评估固定顺序（决定拒绝原因的优先级，保证结论可解释）：
-未授权 -> 已撤销 -> 已过期 -> 已暂停 -> 用途不匹配 -> 接收方不匹配 -> 超出范围。
+未授权 -> 已撤销 -> 已暂停 -> 已过期 -> 用途不匹配 -> 接收方不匹配 -> 超出范围。
+暂停期间即使已过期也以 consent_suspended 拒绝（恢复后再按过期处理）。
 
 所有改变同意状态的写操作（授予/撤销/收窄/暂停/恢复）都遵循失败关闭：
 审计先落盘，落不进去则状态不变；状态变更采用写时复制并在存储锁内完成，
@@ -305,7 +306,24 @@ class ConsentService:
                 denial_reason=DenialReason.CONSENT_REVOKED,
             )
 
-        # 3) 已过期
+        # 3) 已暂停：暂停期间一律以可区分的“暂停中”原因拒绝，
+        #    即使有效期恰好也已过，仍报 consent_suspended 而不是 consent_expired；
+        #    恢复之后再按原有效期判定（过期仍拒绝）。
+        if consent.suspended_at is not None:
+            logger.info(
+                "access_denied consent_id=%s reason=%s expires_at=%s now=%s",
+                consent.consent_id,
+                DenialReason.CONSENT_SUSPENDED.value,
+                consent.expires_at.isoformat() if consent.expires_at else None,
+                moment.isoformat(),
+            )
+            return DecisionResponse(
+                allowed=False,
+                consent_id=consent.consent_id,
+                denial_reason=DenialReason.CONSENT_SUSPENDED,
+            )
+
+        # 4) 已过期（恢复暂停后，过期的同意仍按过期拒绝：暂停不延长有效期）
         if consent.expires_at is not None and consent.expires_at <= moment:
             logger.info(
                 "access_denied consent_id=%s reason=%s expires_at=%s now=%s",
@@ -318,19 +336,6 @@ class ConsentService:
                 allowed=False,
                 consent_id=consent.consent_id,
                 denial_reason=DenialReason.CONSENT_EXPIRED,
-            )
-
-        # 4) 已暂停（临时冻结，恢复前一律拒绝；与撤销/过期可区分）
-        if consent.suspended_at is not None:
-            logger.info(
-                "access_denied consent_id=%s reason=%s",
-                consent.consent_id,
-                DenialReason.CONSENT_SUSPENDED.value,
-            )
-            return DecisionResponse(
-                allowed=False,
-                consent_id=consent.consent_id,
-                denial_reason=DenialReason.CONSENT_SUSPENDED,
             )
 
         # 5/6) 用途、接收方匹配（find_consents 已保证；保留防御性校验）

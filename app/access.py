@@ -35,14 +35,22 @@ class AccessService:
     def access_data(self, req: AccessRequest) -> DataAccessResponse:
         now = _as_aware(req.now)
 
+        # 整个访问（读患者 -> 决策 -> 审计落盘 -> 投影脱敏）在存储锁的同一临界区
+        # 内串行完成，与收窄/暂停/恢复/撤销写操作使用同一把锁（RLock 可重入）。
+        # 因此每个访问线性化在状态变更之前或之后，绝不会半前半后；
+        # 审计事件的落盘顺序也与各请求的决策快照顺序严格一致。
+        with self.store.lock:
+            return self._access_data_locked(req, now)
+
+    def _access_data_locked(
+        self, req: AccessRequest, now
+    ) -> DataAccessResponse:
         patient = self.store.get_patient(req.patient_id)
         if patient is None:
             # 患者不存在按“未授权”处理，且不泄露任何数据
-            decision = self._deny_with_audit(
-                req, now, DenialReason.CONSENT_NOT_FOUND
-            )
+            self._record_denied(req, now, DenialReason.CONSENT_NOT_FOUND, None)
             return DataAccessResponse(
-                allowed=False, denial_reason=decision
+                allowed=False, denial_reason=DenialReason.CONSENT_NOT_FOUND
             )
 
         decision = self.consents.evaluate(
@@ -143,9 +151,3 @@ class AccessService:
             detail="access granted; sensitive fields masked before return",
         )
         self.audit.record(event)
-
-    def _deny_with_audit(
-        self, req: AccessRequest, now, reason: DenialReason
-    ) -> DenialReason:
-        self._record_denied(req, now, reason, None)
-        return reason

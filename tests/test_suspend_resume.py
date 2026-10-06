@@ -210,3 +210,112 @@ def test_narrow_still_applies_while_suspended(client):
     denied = _access(client, requested_fields=["identity"]).json()
     assert denied["denial_reason"] == "scope_exceeded"
     assert _access(client).json()["allowed"] is True
+
+
+def test_suspended_takes_priority_over_expired_during_suspension(client):
+    """暂停期间即使有效期已过，也一律以 consent_suspended 拒绝，
+    不得与 consent_expired 混淆；且不返回任何数据。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    cid = consent["consent_id"]
+    # 过期前暂停
+    client.post(
+        "/consents/suspend",
+        json={"consent_id": cid, "now": "2026-02-01T00:00:00Z"},
+    )
+
+    # 暂停中、尚未过期：暂停
+    body = _access(client, now="2026-03-01T00:00:00Z").json()
+    assert body["allowed"] is False
+    assert body["denial_reason"] == "consent_suspended"
+    assert body["data"] is None
+
+    # 暂停中、有效期已过：仍然必须是暂停，而不是已过期
+    for now in ("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z", "2027-01-01T00:00:00Z"):
+        body = _access(client, now=now).json()
+        assert body["allowed"] is False, now
+        assert body["denial_reason"] == "consent_suspended", now
+        assert body["data"] is None, now
+
+    # 决策端点与数据端点结论一致
+    decision = client.post("/access/decision", json={
+        "patient_id": "P-001",
+        "recipient_id": "R-HOSPITAL",
+        "purpose": "treatment",
+        "requested_fields": ["medical"],
+        "now": "2026-07-01T00:00:00Z",
+    }).json()
+    assert decision["allowed"] is False
+    assert decision["denial_reason"] == "consent_suspended"
+
+
+def test_suspended_after_expiry_still_reports_suspended(client):
+    """先过期、再暂停（暂停操作本身不因过期被拒），访问仍报暂停。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    cid = consent["consent_id"]
+    # 过期之后执行暂停：暂停是管理操作，不受有效期限制
+    resp = client.post(
+        "/consents/suspend",
+        json={"consent_id": cid, "now": "2026-08-01T00:00:00Z"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["suspended_at"] == "2026-08-01T00:00:00Z"
+
+    body = _access(client, now="2026-08-02T00:00:00Z").json()
+    assert body["denial_reason"] == "consent_suspended"
+    assert body["data"] is None
+
+
+def test_resume_of_expired_suspended_consent_reverts_to_expired(client):
+    """暂停+过期叠加解除暂停后：仍按过期处理，暂停没有延长有效期。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    cid = consent["consent_id"]
+    client.post(
+        "/consents/suspend",
+        json={"consent_id": cid, "now": "2026-02-01T00:00:00Z"},
+    )
+    # 过期后恢复：恢复操作成功（暂停是暂态，不因过期拒绝恢复）
+    resp = client.post(
+        "/consents/resume",
+        json={"consent_id": cid, "now": "2026-07-01T00:00:00Z"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["suspended_at"] is None
+
+    # 恢复后访问按过期拒绝，结论与从未暂停过的过期同意一致
+    body = _access(client, now="2026-07-02T00:00:00Z").json()
+    assert body["allowed"] is False
+    assert body["denial_reason"] == "consent_expired"
+    assert body["data"] is None
+
+
+def test_revoked_suspended_expired_consent_reports_revoked(client):
+    """撤销的优先级最高：已暂停且已过期的同意被撤销后，一律按已撤销处理。"""
+    consent = _grant(
+        client,
+        now="2026-01-01T00:00:00Z",
+        expires_at="2026-06-01T00:00:00Z",
+    )
+    cid = consent["consent_id"]
+    client.post(
+        "/consents/suspend",
+        json={"consent_id": cid, "now": "2026-02-01T00:00:00Z"},
+    )
+    client.post(
+        "/consents/revoke",
+        json={"consent_id": cid, "now": "2026-08-01T00:00:00Z"},
+    )
+    body = _access(client, now="2026-08-02T00:00:00Z").json()
+    assert body["denial_reason"] == "consent_revoked"
+    assert body["data"] is None
